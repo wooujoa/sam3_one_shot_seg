@@ -39,27 +39,27 @@ def to_builtin(obj):
 
 class Sam3OneShotNode(Node):
     """
-    One-shot SAM3 segmentation node.
+    One-shot SAM3 segmentation node (LEFT CAMERA VERSION).
 
-    Key changes vs. the previous version:
-    1) target_pc is now a *strict inner-core* cloud for grasp inference.
-    2) object_pc is a *safe object support* cloud for ranking / geometric checks.
-    3) background_pc is built from valid depth minus safe object mask.
-    4) dominant connected component + bbox ROI + depth band are all applied.
-    5) extra debug outputs are published for RViz / inspection.
-    6) object center in camera frame is published as PointStamped.
+    Key points:
+      1) target_pc is strict inner-core cloud for grasp inference
+      2) object_pc is safe object support cloud
+      3) background_pc is valid depth minus safe object mask
+      4) dominant connected component + bbox ROI + depth band applied
+      5) extra debug outputs published
+      6) object center in camera frame published as PointStamped
     """
 
     def __init__(self):
         super().__init__('sam3_one_shot_node')
 
         # ---------------- ROS topics ----------------
-        self.declare_parameter('color_topic', '/camera_r/camera_r/color/image_rect_raw')
-        self.declare_parameter('depth_topic', '/camera_r/camera_r/aligned_depth_to_color/image_raw')
-        self.declare_parameter('camera_info_topic', '/camera_r/camera_r/aligned_depth_to_color/camera_info')
+        self.declare_parameter('color_topic', '/camera_l/camera_l/color/image_rect_raw')
+        self.declare_parameter('depth_topic', '/camera_l/camera_l/aligned_depth_to_color/image_raw')
+        self.declare_parameter('camera_info_topic', '/camera_l/camera_l/aligned_depth_to_color/camera_info')
 
         # ---------------- Prompt / outputs ----------------
-        self.declare_parameter('prompt', 'tumbler with handle')
+        self.declare_parameter('prompt', 'bag of chips')
         self.declare_parameter('save_dir', '/home/jwg/sam3_ros_output')
 
         # ---------------- External SAM3 ----------------
@@ -68,7 +68,7 @@ class Sam3OneShotNode(Node):
         self.declare_parameter('sam3_timeout_sec', 180.0)
 
         # ---------------- Depth filtering ----------------
-        self.declare_parameter('depth_scale', 0.001)  # uint16 mm -> meter
+        self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('depth_min_m', 0.10)
         self.declare_parameter('depth_max_m', 1.20)
 
@@ -83,7 +83,6 @@ class Sam3OneShotNode(Node):
         self.declare_parameter('safe_dilate_iterations', 1)
         self.declare_parameter('min_object_core_pixels', 100)
 
-        # target_pc should be stricter than object_pc
         self.declare_parameter('target_boundary_margin_px', 5.0)
         self.declare_parameter('target_erode_kernel', 5)
         self.declare_parameter('target_erode_iterations', 1)
@@ -298,13 +297,11 @@ class Sam3OneShotNode(Node):
                 object_safe_mask &= band_mask
                 self.get_logger().info(f'depth band = [{z_lo:.3f}, {z_hi:.3f}] m')
 
-        # strict target mask for inference
         target_mask = self.make_strict_target_mask(object_core_mask)
         if int(np.count_nonzero(target_mask)) < self.min_target_pixels:
             self.get_logger().warn('strict target mask too small. Fallback to object_core_mask.')
             target_mask = object_core_mask.copy()
 
-        # safe object mask for geometry / filtering
         object_mask = object_safe_mask & valid_depth
         target_mask = target_mask & valid_depth
         background_mask = valid_depth & (~object_mask)
@@ -360,7 +357,6 @@ class Sam3OneShotNode(Node):
             np.save(os.path.join(self.save_dir, 'background_points_xyzrgb.npy'), self.merge_xyz_rgb(background_xyz, background_rgb))
             np.save(os.path.join(self.save_dir, 'full_scene_xyzrgb.npy'), self.merge_xyz_rgb(full_xyz, full_rgb))
 
-        # save refined masks for debugging
         cv2.imwrite(os.path.join(self.save_dir, 'mask_raw.png'), (raw_mask.astype(np.uint8) * 255))
         cv2.imwrite(os.path.join(self.save_dir, 'mask_dominant.png'), (dominant_mask.astype(np.uint8) * 255))
         cv2.imwrite(os.path.join(self.save_dir, 'mask_object_core.png'), (object_core_mask.astype(np.uint8) * 255))
@@ -383,12 +379,19 @@ class Sam3OneShotNode(Node):
         self.cached_msgs['background'] = self.make_xyz_cloud(frame_id, stamp, background_xyz)
         self.cached_msgs['preview'] = self.make_xyzrgb_cloud(frame_id, stamp, self.make_xyzrgb_tuples(object_xyz, object_rgb))
         self.cached_msgs['full_scene'] = self.make_xyzrgb_cloud(frame_id, stamp, self.make_xyzrgb_tuples(full_xyz, full_rgb))
-        self.cached_msgs['target_mask_img'] = self.bridge.cv2_to_imgmsg((target_mask.astype(np.uint8) * 255), encoding='mono8')
+
+        self.cached_msgs['target_mask_img'] = self.bridge.cv2_to_imgmsg(
+            (target_mask.astype(np.uint8) * 255), encoding='mono8'
+        )
         self.cached_msgs['target_mask_img'].header.frame_id = frame_id
         self.cached_msgs['target_mask_img'].header.stamp = stamp
-        self.cached_msgs['object_mask_img'] = self.bridge.cv2_to_imgmsg((object_mask.astype(np.uint8) * 255), encoding='mono8')
+
+        self.cached_msgs['object_mask_img'] = self.bridge.cv2_to_imgmsg(
+            (object_mask.astype(np.uint8) * 255), encoding='mono8'
+        )
         self.cached_msgs['object_mask_img'].header.frame_id = frame_id
         self.cached_msgs['object_mask_img'].header.stamp = stamp
+
         self.cached_msgs['object_center'] = center_msg
 
         self.publish_remaining = max(1, int(self.publish_repeat_count))
@@ -545,7 +548,11 @@ class Sam3OneShotNode(Node):
         if int(np.count_nonzero(obj_mask_core)) < self.min_object_core_pixels:
             obj_mask_core = obj_mask_raw.copy()
 
-        obj_mask_safe = cv2.dilate((obj_mask_core.astype(np.uint8) * 255), safe_kernel, iterations=max(1, self.safe_dilate_iterations)) > 0
+        obj_mask_safe = cv2.dilate(
+            (obj_mask_core.astype(np.uint8) * 255),
+            safe_kernel,
+            iterations=max(1, self.safe_dilate_iterations)
+        ) > 0
         obj_mask_safe &= roi_mask_2d
         return obj_mask_core, obj_mask_safe
 
@@ -563,7 +570,11 @@ class Sam3OneShotNode(Node):
 
         k = self._odd_kernel(self.target_erode_kernel)
         kernel = np.ones((k, k), dtype=np.uint8)
-        eroded = cv2.erode((target_mask.astype(np.uint8) * 255), kernel, iterations=max(1, self.target_erode_iterations)) > 0
+        eroded = cv2.erode(
+            (target_mask.astype(np.uint8) * 255),
+            kernel,
+            iterations=max(1, self.target_erode_iterations)
+        ) > 0
         if np.count_nonzero(eroded) >= self.min_target_pixels:
             target_mask = eroded
         return target_mask
@@ -578,8 +589,6 @@ class Sam3OneShotNode(Node):
     # ------------------------------------------------------------------
     def depth_to_meters(self, depth_cv: np.ndarray) -> np.ndarray:
         depth = depth_cv.astype(np.float32)
-        if depth.dtype != np.float32:
-            depth = depth.astype(np.float32)
         return depth * float(self.depth_scale)
 
     def build_sampled_points(self, color_rgb: np.ndarray, depth_cv: np.ndarray, camera_info: CameraInfo):
@@ -596,6 +605,7 @@ class Sam3OneShotNode(Node):
 
         z = depth_m[vv, uu]
         valid = np.isfinite(z) & (z >= self.depth_min_m) & (z <= self.depth_max_m)
+
         if not np.any(valid):
             return {
                 'xyz': np.zeros((0, 3), dtype=np.float32),
@@ -607,6 +617,7 @@ class Sam3OneShotNode(Node):
         uu = uu[valid].astype(np.float32)
         vv = vv[valid].astype(np.float32)
         z = z[valid].astype(np.float32)
+
         x = (uu - cx) * z / fx
         y = (vv - cy) * z / fy
         xyz = np.stack([x, y, z], axis=1).astype(np.float32)
@@ -622,8 +633,6 @@ class Sam3OneShotNode(Node):
         return np.concatenate([xyz.astype(np.float32), rgb.astype(np.float32)], axis=1)
 
     def make_xyzrgb_tuples(self, xyz: np.ndarray, rgb: np.ndarray):
-        if xyz.shape[0] == 0:
-            return []
         pts = []
         for p, c in zip(xyz, rgb):
             pts.append((float(p[0]), float(p[1]), float(p[2]), int(c[0]), int(c[1]), int(c[2])))

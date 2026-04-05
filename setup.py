@@ -25,7 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'sam3_one_shot_node = sam3_one_shot_seg.sam3_one_shot_node:main',
-            'sam3_robot_node = sam3_one_shot_seg.sam3_robot_r_node:main',
+            'sam3_robot_r_node = sam3_one_shot_seg.sam3_robot_r_node:main',
+            'sam3_robot_node = sam3_one_shot_seg.sam3_robot_node:main',
         ],
     },
 )
