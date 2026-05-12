@@ -19,7 +19,6 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from cv_bridge import CvBridge
-from message_filters import Subscriber, ApproximateTimeSynchronizer
 
 from std_msgs.msg import Bool, String
 from sensor_msgs.msg import Image as RosImage
@@ -160,6 +159,13 @@ class Sam3Master2Node(Node):
         self.publish_remaining = 0
         self.cached_msgs: Dict[str, object] = {}
 
+        # Latest RGB-D cache.
+        # Robot arm is assumed static during detection, so exact color/depth timestamp sync
+        # is not required. We run with the latest available color + latest available depth.
+        self.latest_color_msg: Optional[RosImage] = None
+        self.latest_depth_msg: Optional[RosImage] = None
+        self.processing = False
+
         self.qos_cmd = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -183,10 +189,12 @@ class Sam3Master2Node(Node):
         self.create_subscription(String, self.prompt_topic, self.prompt_callback, self.qos_cmd)
         self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
 
-        self.color_sub = Subscriber(self, RosImage, self.color_topic)
-        self.depth_sub = Subscriber(self, RosImage, self.depth_topic)
-        self.ts = ApproximateTimeSynchronizer([self.color_sub, self.depth_sub], queue_size=5, slop=0.1)
-        self.ts.registerCallback(self.rgbd_callback)
+        # Do NOT use ApproximateTimeSynchronizer here.
+        # For this task the arm is static while detection runs, so a strict timestamp pair
+        # can unnecessarily block SAM3 when color/depth stamps differ.
+        # Keep normal image QoS/default subscription behavior, same as old code style.
+        self.create_subscription(RosImage, self.color_topic, self.color_callback, 10)
+        self.create_subscription(RosImage, self.depth_topic, self.depth_callback, 10)
 
         self.get_logger().info('========================================')
         self.get_logger().info('SAM3 MASTER2 Node Ready (RIGHT ARM)')
@@ -207,15 +215,22 @@ class Sam3Master2Node(Node):
         if msg.data:
             self.active = True
             self.done = False
+            self.processing = False
             self.cached_msgs.clear()
             self.publish_remaining = 0
             if self.publish_timer is not None:
                 self.publish_timer.cancel()
                 self.publish_timer = None
-            self.get_logger().info(f'[START] {self.start_topic} true. waiting RGB-D frame. prompt="{self.prompt}"')
+
+            self.get_logger().info(
+                f'[START] {self.start_topic} true. ' 
+                f'using latest RGB-D if available. prompt="{self.prompt}"'
+            )
+            self.try_run_with_latest_rgbd(trigger='start')
         else:
             self.active = False
             self.done = False
+            self.processing = False
             self.cached_msgs.clear()
             self.publish_remaining = 0
             if self.publish_timer is not None:
@@ -240,24 +255,59 @@ class Sam3Master2Node(Node):
     # ============================================================
     def camera_info_callback(self, msg: CameraInfo):
         self.camera_info = msg
+        self.try_run_with_latest_rgbd(trigger='camera_info')
 
-    def rgbd_callback(self, color_msg: RosImage, depth_msg: RosImage):
+    def color_callback(self, msg: RosImage):
+        self.latest_color_msg = msg
+        self.try_run_with_latest_rgbd(trigger='color')
+
+    def depth_callback(self, msg: RosImage):
+        self.latest_depth_msg = msg
+        self.try_run_with_latest_rgbd(trigger='depth')
+
+    def try_run_with_latest_rgbd(self, trigger: str = ''):
         if not self.active:
             return
-        if self.done:
+        if self.done or self.processing:
             return
         if self.camera_info is None:
-            self.get_logger().warn('Waiting for camera_info...')
+            if trigger == 'start':
+                self.get_logger().warn('Waiting for camera_info...')
+            return
+        if self.latest_color_msg is None:
+            if trigger == 'start':
+                self.get_logger().warn('Waiting for latest color image...')
+            return
+        if self.latest_depth_msg is None:
+            if trigger == 'start':
+                self.get_logger().warn('Waiting for latest depth image...')
             return
 
         self.done = True
-        self.get_logger().info('Received synchronized RGB-D frame. Starting SAM3 one-shot pipeline...')
+        self.processing = True
+
+        color_stamp = self.stamp_to_float(self.latest_color_msg.header.stamp)
+        depth_stamp = self.stamp_to_float(self.latest_depth_msg.header.stamp)
+        dt = abs(color_stamp - depth_stamp)
+
+        self.get_logger().info(
+            'Using latest RGB-D frame without timestamp synchronization. '
+            f'trigger={trigger}, color_stamp={color_stamp:.9f}, '
+            f'depth_stamp={depth_stamp:.9f}, dt={dt:.3f}s'
+        )
+
         try:
-            self.run_pipeline(color_msg, depth_msg, self.camera_info)
+            self.run_pipeline(self.latest_color_msg, self.latest_depth_msg, self.camera_info)
         except Exception as e:
             self.get_logger().error(f'Pipeline failed: {repr(e)}')
             self.active = False
             self.publish_finish(False)
+        finally:
+            self.processing = False
+
+    @staticmethod
+    def stamp_to_float(stamp) -> float:
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
     # ============================================================
     # Main pipeline
