@@ -27,6 +27,9 @@ setup(
             'sam3_one_shot_node = sam3_one_shot_seg.sam3_one_shot_node:main',
             'sam3_robot_r_node = sam3_one_shot_seg.sam3_robot_r_node:main',
             'sam3_robot_node = sam3_one_shot_seg.sam3_robot_node:main',
+            'sam3_r_custom = sam3_one_shot_seg.sam3_r_custom:main',
+            'SAM3_R = sam3_one_shot_seg.SAM3_R:main',
+            'SAM3_L = sam3_one_shot_seg.SAM3_L:main',
         ],
     },
 )
