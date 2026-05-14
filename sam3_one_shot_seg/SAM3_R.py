@@ -2,7 +2,7 @@
 # SAM3 one-shot segmentation node for master_2 (RIGHT ARM).
 # - waits for /sam3_r_start true before running
 # - prompt from /sam3_r_text_prompt
-# - publishes R/L namespaced point clouds and masks
+# - publishes only pipeline-required topics plus target_pc for RViz through CALI
 # - stays alive for repeated INIT2 cycles
 
 import os
@@ -94,10 +94,8 @@ class Sam3Master2Node(Node):
         self.declare_parameter('target_pc_topic', '/sam3_r/target_pc')
         self.declare_parameter('object_pc_topic', '/sam3_r/object_pc')
         self.declare_parameter('background_pc_topic', '/sam3_r/background_pc')
-        self.declare_parameter('preview_cloud_topic', '/sam3_r/mask_pointcloud')
         self.declare_parameter('full_scene_pc_topic', '/sam3_r/full_scene_pc')
         self.declare_parameter('mask_image_topic', '/sam3_r/target_mask')
-        self.declare_parameter('object_mask_image_topic', '/sam3_r/object_mask')
         self.declare_parameter('object_center_topic', '/sam3_r/object_center_camera')
         self.declare_parameter('publish_repeat_count', 20)
         self.declare_parameter('publish_repeat_period_sec', 0.25)
@@ -143,10 +141,8 @@ class Sam3Master2Node(Node):
         self.target_pc_topic = self.get_parameter('target_pc_topic').value
         self.object_pc_topic = self.get_parameter('object_pc_topic').value
         self.background_pc_topic = self.get_parameter('background_pc_topic').value
-        self.preview_cloud_topic = self.get_parameter('preview_cloud_topic').value
         self.full_scene_pc_topic = self.get_parameter('full_scene_pc_topic').value
         self.mask_image_topic = self.get_parameter('mask_image_topic').value
-        self.object_mask_image_topic = self.get_parameter('object_mask_image_topic').value
         self.object_center_topic = self.get_parameter('object_center_topic').value
 
         os.makedirs(self.save_dir, exist_ok=True)
@@ -177,10 +173,8 @@ class Sam3Master2Node(Node):
         self.target_pub = self.create_publisher(PointCloud2, self.target_pc_topic, 10)
         self.object_pub = self.create_publisher(PointCloud2, self.object_pc_topic, 10)
         self.background_pub = self.create_publisher(PointCloud2, self.background_pc_topic, 10)
-        self.preview_pub = self.create_publisher(PointCloud2, self.preview_cloud_topic, 10)
         self.full_scene_pub = self.create_publisher(PointCloud2, self.full_scene_pc_topic, 10)
         self.mask_pub = self.create_publisher(RosImage, self.mask_image_topic, 10)
-        self.object_mask_pub = self.create_publisher(RosImage, self.object_mask_image_topic, 10)
         self.object_center_pub = self.create_publisher(PointStamped, self.object_center_topic, 10)
         self.finish_pub = self.create_publisher(Bool, self.finish_topic, self.qos_cmd)
 
@@ -443,14 +437,10 @@ class Sam3Master2Node(Node):
         self.cached_msgs['target'] = self.make_xyz_cloud(frame_id, stamp, target_xyz)
         self.cached_msgs['object'] = self.make_xyz_cloud(frame_id, stamp, object_xyz)
         self.cached_msgs['background'] = self.make_xyz_cloud(frame_id, stamp, background_xyz)
-        self.cached_msgs['preview'] = self.make_xyzrgb_cloud(frame_id, stamp, self.make_xyzrgb_tuples(object_xyz, object_rgb))
         self.cached_msgs['full_scene'] = self.make_xyzrgb_cloud(frame_id, stamp, self.make_xyzrgb_tuples(full_xyz, full_rgb))
         self.cached_msgs['target_mask_img'] = self.bridge.cv2_to_imgmsg((target_mask.astype(np.uint8) * 255), encoding='mono8')
         self.cached_msgs['target_mask_img'].header.frame_id = frame_id
         self.cached_msgs['target_mask_img'].header.stamp = stamp
-        self.cached_msgs['object_mask_img'] = self.bridge.cv2_to_imgmsg((object_mask.astype(np.uint8) * 255), encoding='mono8')
-        self.cached_msgs['object_mask_img'].header.frame_id = frame_id
-        self.cached_msgs['object_mask_img'].header.stamp = stamp
         self.cached_msgs['object_center'] = center_msg
 
         self.publish_remaining = max(1, int(self.publish_repeat_count))
@@ -480,14 +470,10 @@ class Sam3Master2Node(Node):
             self.object_pub.publish(msg['object'])
         if 'background' in msg:
             self.background_pub.publish(msg['background'])
-        if 'preview' in msg:
-            self.preview_pub.publish(msg['preview'])
         if 'full_scene' in msg:
             self.full_scene_pub.publish(msg['full_scene'])
         if 'target_mask_img' in msg:
             self.mask_pub.publish(msg['target_mask_img'])
-        if 'object_mask_img' in msg:
-            self.object_mask_pub.publish(msg['object_mask_img'])
         if 'object_center' in msg:
             self.object_center_pub.publish(msg['object_center'])
         self.publish_remaining -= 1
