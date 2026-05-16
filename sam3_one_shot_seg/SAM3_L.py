@@ -2,7 +2,7 @@
 # SAM3 one-shot segmentation node for master_2 (LEFT ARM).
 # - waits for /sam3_l_start true before running
 # - prompt from /sam3_l_text_prompt
-# - publishes R/L namespaced point clouds and masks
+# - publishes only pipeline-required topics plus target_pc for RViz through CALI
 # - stays alive for repeated INIT2 cycles
 
 import os
@@ -19,7 +19,6 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from cv_bridge import CvBridge
-from message_filters import Subscriber, ApproximateTimeSynchronizer
 
 from std_msgs.msg import Bool, String
 from sensor_msgs.msg import Image as RosImage
@@ -73,6 +72,11 @@ class Sam3Master2Node(Node):
         self.declare_parameter('depth_min_m', 0.10)
         self.declare_parameter('depth_max_m', 1.20)
 
+        # ---------------- RGB-D synchronization / freshness ----------------
+        # Detection starts only after master publishes /sam3_*_start true.
+        # Do not reuse RGB/depth cached before arm alignment.
+        self.declare_parameter('rgbd_sync_tolerance_sec', 0.30)
+
         # ---------------- 2D mask refinement ----------------
         self.declare_parameter('bbox_expand_ratio', 0.08)
         self.declare_parameter('bbox_expand_min_px', 8)
@@ -95,10 +99,8 @@ class Sam3Master2Node(Node):
         self.declare_parameter('target_pc_topic', '/sam3_l/target_pc')
         self.declare_parameter('object_pc_topic', '/sam3_l/object_pc')
         self.declare_parameter('background_pc_topic', '/sam3_l/background_pc')
-        self.declare_parameter('preview_cloud_topic', '/sam3_l/mask_pointcloud')
         self.declare_parameter('full_scene_pc_topic', '/sam3_l/full_scene_pc')
         self.declare_parameter('mask_image_topic', '/sam3_l/target_mask')
-        self.declare_parameter('object_mask_image_topic', '/sam3_l/object_mask')
         self.declare_parameter('object_center_topic', '/sam3_l/object_center_camera')
         self.declare_parameter('publish_repeat_count', 20)
         self.declare_parameter('publish_repeat_period_sec', 0.25)
@@ -120,6 +122,7 @@ class Sam3Master2Node(Node):
         self.depth_scale = float(self.get_parameter('depth_scale').value)
         self.depth_min_m = float(self.get_parameter('depth_min_m').value)
         self.depth_max_m = float(self.get_parameter('depth_max_m').value)
+        self.rgbd_sync_tolerance_sec = float(self.get_parameter('rgbd_sync_tolerance_sec').value)
         self.bbox_expand_ratio = float(self.get_parameter('bbox_expand_ratio').value)
         self.bbox_expand_min_px = int(self.get_parameter('bbox_expand_min_px').value)
         self.min_component_pixels = int(self.get_parameter('min_component_pixels').value)
@@ -144,10 +147,8 @@ class Sam3Master2Node(Node):
         self.target_pc_topic = self.get_parameter('target_pc_topic').value
         self.object_pc_topic = self.get_parameter('object_pc_topic').value
         self.background_pc_topic = self.get_parameter('background_pc_topic').value
-        self.preview_cloud_topic = self.get_parameter('preview_cloud_topic').value
         self.full_scene_pc_topic = self.get_parameter('full_scene_pc_topic').value
         self.mask_image_topic = self.get_parameter('mask_image_topic').value
-        self.object_mask_image_topic = self.get_parameter('object_mask_image_topic').value
         self.object_center_topic = self.get_parameter('object_center_topic').value
 
         os.makedirs(self.save_dir, exist_ok=True)
@@ -160,9 +161,22 @@ class Sam3Master2Node(Node):
         self.publish_remaining = 0
         self.cached_msgs: Dict[str, object] = {}
 
+        # Latest RGB-D cache.
+        # Robot arm is assumed static during detection, so exact color/depth timestamp sync
+        # is not required. We run with the latest available color + latest available depth.
+        self.latest_color_msg: Optional[RosImage] = None
+        self.latest_depth_msg: Optional[RosImage] = None
+        self.processing = False
+
         self.qos_cmd = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.qos_sensor = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
@@ -171,22 +185,23 @@ class Sam3Master2Node(Node):
         self.target_pub = self.create_publisher(PointCloud2, self.target_pc_topic, 10)
         self.object_pub = self.create_publisher(PointCloud2, self.object_pc_topic, 10)
         self.background_pub = self.create_publisher(PointCloud2, self.background_pc_topic, 10)
-        self.preview_pub = self.create_publisher(PointCloud2, self.preview_cloud_topic, 10)
         self.full_scene_pub = self.create_publisher(PointCloud2, self.full_scene_pc_topic, 10)
         self.mask_pub = self.create_publisher(RosImage, self.mask_image_topic, 10)
-        self.object_mask_pub = self.create_publisher(RosImage, self.object_mask_image_topic, 10)
         self.object_center_pub = self.create_publisher(PointStamped, self.object_center_topic, 10)
         self.finish_pub = self.create_publisher(Bool, self.finish_topic, self.qos_cmd)
 
         # ---------------- subscribers ----------------
         self.create_subscription(Bool, self.start_topic, self.start_callback, self.qos_cmd)
         self.create_subscription(String, self.prompt_topic, self.prompt_callback, self.qos_cmd)
+        # CameraInfo is small calibration data; keep default/reliable QoS so it is not missed.
         self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
 
-        self.color_sub = Subscriber(self, RosImage, self.color_topic)
-        self.depth_sub = Subscriber(self, RosImage, self.depth_topic)
-        self.ts = ApproximateTimeSynchronizer([self.color_sub, self.depth_sub], queue_size=5, slop=0.1)
-        self.ts.registerCallback(self.rgbd_callback)
+        # Sensor topics must not keep old frames. Use VOLATILE + KEEP_LAST(1).
+        # RGB and depth are still received with normal callbacks, but the node
+        # only runs when both frames are fresh after /sam3_*_start and their
+        # timestamps are close enough.
+        self.create_subscription(RosImage, self.color_topic, self.color_callback, self.qos_sensor)
+        self.create_subscription(RosImage, self.depth_topic, self.depth_callback, self.qos_sensor)
 
         self.get_logger().info('========================================')
         self.get_logger().info('SAM3 MASTER2 Node Ready (LEFT ARM)')
@@ -198,6 +213,7 @@ class Sam3Master2Node(Node):
         self.get_logger().info(f'depth_topic       : {self.depth_topic}')
         self.get_logger().info(f'target_pc_topic   : {self.target_pc_topic}')
         self.get_logger().info(f'object_pc_topic   : {self.object_pc_topic}')
+        self.get_logger().info(f'rgbd_sync_tolerance_sec: {self.rgbd_sync_tolerance_sec:.3f}')
         self.get_logger().info('========================================')
 
     # ============================================================
@@ -207,21 +223,37 @@ class Sam3Master2Node(Node):
         if msg.data:
             self.active = True
             self.done = False
+            self.processing = False
             self.cached_msgs.clear()
             self.publish_remaining = 0
             if self.publish_timer is not None:
                 self.publish_timer.cancel()
                 self.publish_timer = None
-            self.get_logger().info(f'[START] {self.start_topic} true. waiting RGB-D frame. prompt="{self.prompt}"')
+
+            # Critical: discard only RGB-D image frames captured before arm alignment.
+            # Do NOT clear self.camera_info here. CameraInfo is calibration data and
+            # may be published at a lower rate; keeping the cached CameraInfo prevents
+            # the node from stalling at start.
+            self.latest_color_msg = None
+            self.latest_depth_msg = None
+
+            self.get_logger().info(
+                f'[START] {self.start_topic} true. ' 
+                f'cleared old RGB-D cache; waiting fresh synchronized frames. prompt="{self.prompt}"'
+            )
+            self.try_run_with_latest_rgbd(trigger='start')
         else:
             self.active = False
             self.done = False
+            self.processing = False
             self.cached_msgs.clear()
             self.publish_remaining = 0
+            self.latest_color_msg = None
+            self.latest_depth_msg = None
             if self.publish_timer is not None:
                 self.publish_timer.cancel()
                 self.publish_timer = None
-            self.get_logger().info(f'[STOP] {self.start_topic} false. paused.')
+            self.get_logger().info(f'[STOP] {self.start_topic} false. paused and RGB-D cache cleared.')
 
     def prompt_callback(self, msg: String):
         prompt = msg.data.strip()
@@ -239,25 +271,90 @@ class Sam3Master2Node(Node):
     # ROS callbacks
     # ============================================================
     def camera_info_callback(self, msg: CameraInfo):
+        # CameraInfo is calibration data. It is okay to keep it cached, but
+        # image frames themselves are cleared at every /sam3_*_start.
         self.camera_info = msg
+        self.try_run_with_latest_rgbd(trigger='camera_info')
 
-    def rgbd_callback(self, color_msg: RosImage, depth_msg: RosImage):
+    def color_callback(self, msg: RosImage):
+        # Cache is cleared at every /sam3_*_start. Therefore any image that
+        # arrives here after start_callback is considered fresh for this cycle.
+        # Do NOT compare msg.header.stamp with start time here: camera driver
+        # stamps can be slightly older than callback arrival time, which caused
+        # valid post-start frames to be discarded. The only hard sync check is
+        # color-depth timestamp difference in try_run_with_latest_rgbd().
         if not self.active:
             return
-        if self.done:
+        self.latest_color_msg = msg
+        self.try_run_with_latest_rgbd(trigger='color')
+
+    def depth_callback(self, msg: RosImage):
+        # Same rule as color_callback: after start, accept the newly received
+        # depth frame into the empty cache, then validate it against color by
+        # RGB-D timestamp difference.
+        if not self.active:
+            return
+        self.latest_depth_msg = msg
+        self.try_run_with_latest_rgbd(trigger='depth')
+
+    def try_run_with_latest_rgbd(self, trigger: str = ''):
+        if not self.active:
+            return
+        if self.done or self.processing:
             return
         if self.camera_info is None:
-            self.get_logger().warn('Waiting for camera_info...')
+            if trigger == 'start':
+                self.get_logger().warn('Waiting for camera_info...')
+            return
+        if self.latest_color_msg is None:
+            if trigger == 'start':
+                self.get_logger().warn('Waiting for fresh color image after start...')
+            return
+        if self.latest_depth_msg is None:
+            if trigger == 'start':
+                self.get_logger().warn('Waiting for fresh depth image after start...')
+            return
+
+        color_stamp = self.stamp_to_float(self.latest_color_msg.header.stamp)
+        depth_stamp = self.stamp_to_float(self.latest_depth_msg.header.stamp)
+        dt = abs(color_stamp - depth_stamp)
+
+        # Do not pair an RGB frame after alignment with a depth frame before alignment.
+        # If stamps are too far apart, drop the older cached image and wait for a fresh pair.
+        if dt > self.rgbd_sync_tolerance_sec:
+            self.get_logger().warn(
+                'RGB-D timestamp mismatch. Waiting for a fresh pair. '
+                f'trigger={trigger}, color_stamp={color_stamp:.9f}, '
+                f'depth_stamp={depth_stamp:.9f}, dt={dt:.3f}s '
+                f'> tol={self.rgbd_sync_tolerance_sec:.3f}s'
+            )
+            if color_stamp > depth_stamp:
+                self.latest_depth_msg = None
+            else:
+                self.latest_color_msg = None
             return
 
         self.done = True
-        self.get_logger().info('Received synchronized RGB-D frame. Starting SAM3 one-shot pipeline...')
+        self.processing = True
+
+        self.get_logger().info(
+            'Using fresh synchronized RGB-D frame. '
+            f'trigger={trigger}, color_stamp={color_stamp:.9f}, '
+            f'depth_stamp={depth_stamp:.9f}, dt={dt:.3f}s'
+        )
+
         try:
-            self.run_pipeline(color_msg, depth_msg, self.camera_info)
+            self.run_pipeline(self.latest_color_msg, self.latest_depth_msg, self.camera_info)
         except Exception as e:
             self.get_logger().error(f'Pipeline failed: {repr(e)}')
             self.active = False
             self.publish_finish(False)
+        finally:
+            self.processing = False
+
+    @staticmethod
+    def stamp_to_float(stamp) -> float:
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
     # ============================================================
     # Main pipeline
@@ -393,14 +490,10 @@ class Sam3Master2Node(Node):
         self.cached_msgs['target'] = self.make_xyz_cloud(frame_id, stamp, target_xyz)
         self.cached_msgs['object'] = self.make_xyz_cloud(frame_id, stamp, object_xyz)
         self.cached_msgs['background'] = self.make_xyz_cloud(frame_id, stamp, background_xyz)
-        self.cached_msgs['preview'] = self.make_xyzrgb_cloud(frame_id, stamp, self.make_xyzrgb_tuples(object_xyz, object_rgb))
         self.cached_msgs['full_scene'] = self.make_xyzrgb_cloud(frame_id, stamp, self.make_xyzrgb_tuples(full_xyz, full_rgb))
         self.cached_msgs['target_mask_img'] = self.bridge.cv2_to_imgmsg((target_mask.astype(np.uint8) * 255), encoding='mono8')
         self.cached_msgs['target_mask_img'].header.frame_id = frame_id
         self.cached_msgs['target_mask_img'].header.stamp = stamp
-        self.cached_msgs['object_mask_img'] = self.bridge.cv2_to_imgmsg((object_mask.astype(np.uint8) * 255), encoding='mono8')
-        self.cached_msgs['object_mask_img'].header.frame_id = frame_id
-        self.cached_msgs['object_mask_img'].header.stamp = stamp
         self.cached_msgs['object_center'] = center_msg
 
         self.publish_remaining = max(1, int(self.publish_repeat_count))
@@ -430,14 +523,10 @@ class Sam3Master2Node(Node):
             self.object_pub.publish(msg['object'])
         if 'background' in msg:
             self.background_pub.publish(msg['background'])
-        if 'preview' in msg:
-            self.preview_pub.publish(msg['preview'])
         if 'full_scene' in msg:
             self.full_scene_pub.publish(msg['full_scene'])
         if 'target_mask_img' in msg:
             self.mask_pub.publish(msg['target_mask_img'])
-        if 'object_mask_img' in msg:
-            self.object_mask_pub.publish(msg['object_mask_img'])
         if 'object_center' in msg:
             self.object_center_pub.publish(msg['object_center'])
         self.publish_remaining -= 1
