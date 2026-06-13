@@ -4,6 +4,7 @@
 # - prompt from /sam3_r_text_prompt
 # - publishes only pipeline-required topics plus target_pc for RViz through CALI
 # - stays alive for repeated INIT2 cycles
+# - compressed-only RGB and compressedDepth-only depth input for cross-PC DDS stability
 
 import os
 import cv2
@@ -22,6 +23,7 @@ from cv_bridge import CvBridge
 
 from std_msgs.msg import Bool, String
 from sensor_msgs.msg import Image as RosImage
+from sensor_msgs.msg import CompressedImage
 from sensor_msgs.msg import CameraInfo, PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
 from geometry_msgs.msg import PointStamped
@@ -54,9 +56,15 @@ class Sam3Master2Node(Node):
         self.declare_parameter('finish_topic', '/sam3_r_finish')
 
         # ---------------- ROS topics ----------------
+        # Compressed-only image input. Raw image topics are kept as parameters
+        # only for reference/backward compatibility, but this node does NOT subscribe to them.
         self.declare_parameter('color_topic', '/camera_r/camera_r/color/image_rect_raw')
+        self.declare_parameter('color_compressed_topic', '/camera_r/camera_r/color/image_rect_raw/compressed')
         self.declare_parameter('depth_topic', '/camera_r/camera_r/aligned_depth_to_color/image_raw')
+        self.declare_parameter('depth_compressed_topic', '/camera_r/camera_r/aligned_depth_to_color/image_raw/compressedDepth')
         self.declare_parameter('camera_info_topic', '/camera_r/camera_r/aligned_depth_to_color/camera_info')
+        self.declare_parameter('fallback_camera_info_topic', '/sam3_r/camera_info_fallback')
+        self.declare_parameter('local_camera_info_cache_yaml', '~/colcon_ws/src/master_capstone/config/camera_r_aligned.yaml')
 
         # ---------------- Prompt / outputs ----------------
         self.declare_parameter('prompt', 'target object')
@@ -112,8 +120,12 @@ class Sam3Master2Node(Node):
         self.prompt_topic = self.get_parameter('prompt_topic').value
         self.finish_topic = self.get_parameter('finish_topic').value
         self.color_topic = self.get_parameter('color_topic').value
+        self.color_compressed_topic = self.get_parameter('color_compressed_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
+        self.depth_compressed_topic = self.get_parameter('depth_compressed_topic').value
         self.camera_info_topic = self.get_parameter('camera_info_topic').value
+        self.fallback_camera_info_topic = self.get_parameter('fallback_camera_info_topic').value
+        self.local_camera_info_cache_yaml = os.path.expanduser(str(self.get_parameter('local_camera_info_cache_yaml').value))
         self.prompt = self.get_parameter('prompt').value
         self.save_dir = self.get_parameter('save_dir').value
         self.conda_env_name = self.get_parameter('conda_env_name').value
@@ -155,6 +167,8 @@ class Sam3Master2Node(Node):
 
         self.bridge = CvBridge()
         self.camera_info: Optional[CameraInfo] = None
+        self.fallback_camera_info: Optional[CameraInfo] = None
+        self.local_camera_info: Optional[CameraInfo] = self.load_camera_info_yaml(self.local_camera_info_cache_yaml)
         self.active = False
         self.done = False
         self.publish_timer = None
@@ -165,8 +179,12 @@ class Sam3Master2Node(Node):
         # Robot arm is assumed static during detection, so exact color/depth timestamp sync
         # is not required. We run with the latest available color + latest available depth.
         self.latest_color_msg: Optional[RosImage] = None
+        self.latest_color_source = ''
         self.latest_depth_msg: Optional[RosImage] = None
+        self.latest_depth_source = ''
         self.processing = False
+        self._compressed_color_seen_once = False
+        self._compressed_depth_seen_once = False
 
         self.qos_cmd = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -177,6 +195,20 @@ class Sam3Master2Node(Node):
         self.qos_sensor = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        # image_transport compressed/compressedDepth publishers here are RELIABLE + TRANSIENT_LOCAL.
+        # Use the same QoS and KEEP_LAST(1) to avoid raw image subscriptions and reduce DDS load.
+        self.qos_compressed_sensor = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.qos_camera_info_fallback = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
@@ -195,13 +227,28 @@ class Sam3Master2Node(Node):
         self.create_subscription(String, self.prompt_topic, self.prompt_callback, self.qos_cmd)
         # CameraInfo is small calibration data; keep default/reliable QoS so it is not missed.
         self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
+        self.create_subscription(
+            CameraInfo,
+            self.fallback_camera_info_topic,
+            self.fallback_camera_info_callback,
+            self.qos_camera_info_fallback,
+        )
 
-        # Sensor topics must not keep old frames. Use VOLATILE + KEEP_LAST(1).
-        # RGB and depth are still received with normal callbacks, but the node
-        # only runs when both frames are fresh after /sam3_*_start and their
-        # timestamps are close enough.
-        self.create_subscription(RosImage, self.color_topic, self.color_callback, self.qos_sensor)
-        self.create_subscription(RosImage, self.depth_topic, self.depth_callback, self.qos_sensor)
+        # Compressed-only sensor subscriptions.
+        # Do NOT subscribe to raw color/depth here. On the robot-local split setup,
+        # raw image subscriptions can overload DDS buffers and prevent depth delivery.
+        self.create_subscription(
+            CompressedImage,
+            self.color_compressed_topic,
+            self.compressed_color_callback,
+            self.qos_compressed_sensor,
+        )
+        self.create_subscription(
+            CompressedImage,
+            self.depth_compressed_topic,
+            self.compressed_depth_callback,
+            self.qos_compressed_sensor,
+        )
 
         self.get_logger().info('========================================')
         self.get_logger().info('SAM3 MASTER2 Node Ready (RIGHT ARM)')
@@ -209,8 +256,21 @@ class Sam3Master2Node(Node):
         self.get_logger().info(f'prompt_topic      : {self.prompt_topic}')
         self.get_logger().info(f'finish_topic      : {self.finish_topic}')
         self.get_logger().info(f'prompt            : "{self.prompt}"')
-        self.get_logger().info(f'color_topic       : {self.color_topic}')
-        self.get_logger().info(f'depth_topic       : {self.depth_topic}')
+        self.get_logger().info(f'color_topic       : {self.color_topic}  # not subscribed in compressed-only mode')
+        self.get_logger().info(f'color_compressed_topic: {self.color_compressed_topic}')
+        self.get_logger().info(f'depth_topic       : {self.depth_topic}  # not subscribed in compressed-only mode')
+        self.get_logger().info(f'depth_compressed_topic: {self.depth_compressed_topic}')
+        self.get_logger().info(f'camera_info_topic : {self.camera_info_topic}')
+        self.get_logger().info(f'fallback_camera_info_topic: {self.fallback_camera_info_topic}')
+        self.get_logger().info(f'local_camera_info_cache_yaml: {self.local_camera_info_cache_yaml}')
+        if self.local_camera_info is not None:
+            self.get_logger().info(
+                f'[LOCAL CAMERA_INFO CACHE] loaded frame_id={self.local_camera_info.header.frame_id}, '
+                f'size={self.local_camera_info.width}x{self.local_camera_info.height}, '
+                f'fx={self.local_camera_info.k[0]:.3f}, fy={self.local_camera_info.k[4]:.3f}'
+            )
+        else:
+            self.get_logger().warn('[LOCAL CAMERA_INFO CACHE] not found or invalid. Will use topic camera_info/fallback only.')
         self.get_logger().info(f'target_pc_topic   : {self.target_pc_topic}')
         self.get_logger().info(f'object_pc_topic   : {self.object_pc_topic}')
         self.get_logger().info(f'rgbd_sync_tolerance_sec: {self.rgbd_sync_tolerance_sec:.3f}')
@@ -235,6 +295,7 @@ class Sam3Master2Node(Node):
             # may be published at a lower rate; keeping the cached CameraInfo prevents
             # the node from stalling at start.
             self.latest_color_msg = None
+            self.latest_color_source = ''
             self.latest_depth_msg = None
 
             self.get_logger().info(
@@ -249,6 +310,7 @@ class Sam3Master2Node(Node):
             self.cached_msgs.clear()
             self.publish_remaining = 0
             self.latest_color_msg = None
+            self.latest_color_source = ''
             self.latest_depth_msg = None
             if self.publish_timer is not None:
                 self.publish_timer.cancel()
@@ -276,44 +338,155 @@ class Sam3Master2Node(Node):
         self.camera_info = msg
         self.try_run_with_latest_rgbd(trigger='camera_info')
 
-    def color_callback(self, msg: RosImage):
-        # Cache is cleared at every /sam3_*_start. Therefore any image that
-        # arrives here after start_callback is considered fresh for this cycle.
-        # Do NOT compare msg.header.stamp with start time here: camera driver
-        # stamps can be slightly older than callback arrival time, which caused
-        # valid post-start frames to be discarded. The only hard sync check is
-        # color-depth timestamp difference in try_run_with_latest_rgbd().
-        if not self.active:
-            return
-        self.latest_color_msg = msg
-        self.try_run_with_latest_rgbd(trigger='color')
+    def fallback_camera_info_callback(self, msg: CameraInfo):
+        # Fallback CameraInfo from master. This is used only when the original
+        # RealSense CameraInfo has not arrived in this SAM3 node.
+        self.fallback_camera_info = msg
+        self.get_logger().info(
+            f'[RX fallback camera_info] topic={self.fallback_camera_info_topic}, '
+            f'frame_id={msg.header.frame_id}, size={msg.width}x{msg.height}, '
+            f'fx={msg.k[0]:.3f}, fy={msg.k[4]:.3f}'
+        )
+        self.try_run_with_latest_rgbd(trigger='fallback_camera_info')
 
-    def depth_callback(self, msg: RosImage):
-        # Same rule as color_callback: after start, accept the newly received
-        # depth frame into the empty cache, then validate it against color by
-        # RGB-D timestamp difference.
+    def compressed_color_callback(self, msg: CompressedImage):
+        # Compressed color image path for remote/local split systems.
+        # The decoded image is converted back to sensor_msgs/Image so the rest
+        # of the pipeline remains unchanged.
         if not self.active:
             return
-        self.latest_depth_msg = msg
-        self.try_run_with_latest_rgbd(trigger='depth')
+        try:
+            np_arr = np.frombuffer(msg.data, dtype=np.uint8)
+            color_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if color_bgr is None:
+                self.get_logger().warn('[RX color compressed] cv2.imdecode returned None. Drop frame.')
+                return
+            img_msg = self.bridge.cv2_to_imgmsg(color_bgr, encoding='bgr8')
+            img_msg.header = msg.header
+            self.latest_color_msg = img_msg
+            self.latest_color_source = 'compressed'
+            if not self._compressed_color_seen_once:
+                self._compressed_color_seen_once = True
+                self.get_logger().info(
+                    f'[RX color compressed] topic={self.color_compressed_topic}, '
+                    f'format={msg.format}, decoded_size={img_msg.width}x{img_msg.height}, '
+                    f'stamp={self.stamp_to_float(msg.header.stamp):.9f}'
+                )
+            self.try_run_with_latest_rgbd(trigger='color_compressed')
+        except Exception as e:
+            self.get_logger().warn(f'[RX color compressed] decode failed: {repr(e)}')
+
+    def compressed_depth_callback(self, msg: CompressedImage):
+        # CompressedDepth-only depth input.
+        # RealSense aligned_depth_to_color/image_raw/compressedDepth usually uses
+        # sensor_msgs/CompressedImage with format like '16UC1; compressedDepth png'.
+        # compressed_depth_transport prepends a 12-byte header before the PNG payload.
+        if not self.active:
+            return
+        try:
+            depth_cv = self.decode_compressed_depth(msg)
+            if depth_cv is None:
+                self.get_logger().warn(
+                    f'[RX depth compressed] failed to decode. topic={self.depth_compressed_topic}, format={msg.format}'
+                )
+                return
+
+            if depth_cv.dtype == np.uint16:
+                encoding = '16UC1'
+            elif depth_cv.dtype == np.float32:
+                encoding = '32FC1'
+            else:
+                # Keep depth in uint16 millimeter-like units when possible.
+                depth_cv = depth_cv.astype(np.uint16)
+                encoding = '16UC1'
+
+            depth_msg = self.bridge.cv2_to_imgmsg(depth_cv, encoding=encoding)
+            depth_msg.header = msg.header
+            self.latest_depth_msg = depth_msg
+            self.latest_depth_source = 'compressedDepth'
+            if not self._compressed_depth_seen_once:
+                self._compressed_depth_seen_once = True
+                self.get_logger().info(
+                    f'[RX depth compressed] topic={self.depth_compressed_topic}, '
+                    f'format={msg.format}, decoded_size={depth_msg.width}x{depth_msg.height}, '
+                    f'encoding={encoding}, stamp={self.stamp_to_float(msg.header.stamp):.9f}'
+                )
+            self.try_run_with_latest_rgbd(trigger='depth_compressed')
+        except Exception as e:
+            self.get_logger().warn(f'[RX depth compressed] decode failed: {repr(e)}')
+
+    @staticmethod
+    def decode_compressed_depth(msg: CompressedImage):
+        data = np.frombuffer(msg.data, dtype=np.uint8)
+        fmt = (msg.format or '').lower()
+
+        # compressed_depth_transport: 12-byte ConfigHeader + PNG.
+        candidates = []
+        if 'compresseddepth' in fmt:
+            candidates.append(data[12:])
+        candidates.append(data)
+
+        for candidate in candidates:
+            if candidate.size == 0:
+                continue
+            depth = cv2.imdecode(candidate, cv2.IMREAD_UNCHANGED)
+            if depth is not None:
+                if depth.ndim == 3:
+                    depth = depth[:, :, 0]
+                return depth
+        return None
 
     def try_run_with_latest_rgbd(self, trigger: str = ''):
         if not self.active:
             return
         if self.done or self.processing:
             return
-        if self.camera_info is None:
+        camera_info_to_use = self.camera_info
+        camera_info_source = 'camera_info_topic'
+        using_fallback_camera_info = False
+        using_local_camera_info = False
+        if camera_info_to_use is None and self.fallback_camera_info is not None:
+            camera_info_to_use = self.fallback_camera_info
+            camera_info_source = 'master_fallback_topic'
+            using_fallback_camera_info = True
+        if camera_info_to_use is None and self.local_camera_info is not None:
+            camera_info_to_use = self.local_camera_info
+            camera_info_source = 'local_yaml_cache'
+            using_local_camera_info = True
+
+        if camera_info_to_use is None:
             if trigger == 'start':
-                self.get_logger().warn('Waiting for camera_info...')
+                self.get_logger().warn('Waiting for camera_info, fallback_camera_info, or local yaml camera_info...')
             return
         if self.latest_color_msg is None:
-            if trigger == 'start':
-                self.get_logger().warn('Waiting for fresh color image after start...')
+            self.get_logger().warn(
+                f'Waiting for fresh compressed color image after start... trigger={trigger}'
+            )
             return
         if self.latest_depth_msg is None:
-            if trigger == 'start':
-                self.get_logger().warn('Waiting for fresh depth image after start...')
+            self.get_logger().warn(
+                f'Waiting for fresh compressed depth image after start... trigger={trigger}'
+            )
             return
+
+        if using_fallback_camera_info:
+            if not self.validate_fallback_camera_info(camera_info_to_use, self.latest_color_msg, self.latest_depth_msg):
+                return
+            self.get_logger().warn(
+                f'[CAMERA_INFO] using fallback camera_info from master: '
+                f'frame_id={camera_info_to_use.header.frame_id}, '
+                f'size={camera_info_to_use.width}x{camera_info_to_use.height}'
+            )
+
+        if using_local_camera_info:
+            if not self.validate_fallback_camera_info(camera_info_to_use, self.latest_color_msg, self.latest_depth_msg):
+                return
+            self.get_logger().warn(
+                f'[CAMERA_INFO] using local yaml camera_info: '
+                f'path={self.local_camera_info_cache_yaml}, '
+                f'frame_id={camera_info_to_use.header.frame_id}, '
+                f'size={camera_info_to_use.width}x{camera_info_to_use.height}'
+            )
 
         color_stamp = self.stamp_to_float(self.latest_color_msg.header.stamp)
         depth_stamp = self.stamp_to_float(self.latest_depth_msg.header.stamp)
@@ -339,18 +512,47 @@ class Sam3Master2Node(Node):
 
         self.get_logger().info(
             'Using fresh synchronized RGB-D frame. '
-            f'trigger={trigger}, color_stamp={color_stamp:.9f}, '
+            f'trigger={trigger}, camera_info_source={camera_info_source}, '
+            f'color_source={self.latest_color_source}, '
+            f'depth_source={self.latest_depth_source}, '
+            f'color_stamp={color_stamp:.9f}, '
             f'depth_stamp={depth_stamp:.9f}, dt={dt:.3f}s'
         )
 
         try:
-            self.run_pipeline(self.latest_color_msg, self.latest_depth_msg, self.camera_info)
+            self.run_pipeline(self.latest_color_msg, self.latest_depth_msg, camera_info_to_use)
         except Exception as e:
             self.get_logger().error(f'Pipeline failed: {repr(e)}')
             self.active = False
             self.publish_finish(False)
         finally:
             self.processing = False
+
+    def validate_fallback_camera_info(self, camera_info: CameraInfo, color_msg: RosImage, depth_msg: RosImage) -> bool:
+        if int(camera_info.width) != int(color_msg.width) or int(camera_info.height) != int(color_msg.height):
+            self.get_logger().error(
+                'Fallback CameraInfo size mismatch. '
+                f'camera_info={camera_info.width}x{camera_info.height}, '
+                f'color={color_msg.width}x{color_msg.height}. '
+                'Wait for original camera_info instead.'
+            )
+            self.fallback_camera_info = None
+            return False
+
+        if int(depth_msg.width) != int(color_msg.width) or int(depth_msg.height) != int(color_msg.height):
+            self.get_logger().error(
+                'RGB-depth size mismatch. '
+                f'color={color_msg.width}x{color_msg.height}, '
+                f'depth={depth_msg.width}x{depth_msg.height}.'
+            )
+            return False
+
+        if len(camera_info.k) < 9 or float(camera_info.k[0]) <= 0.0 or float(camera_info.k[4]) <= 0.0:
+            self.get_logger().error('Fallback CameraInfo has invalid intrinsic matrix K.')
+            self.fallback_camera_info = None
+            return False
+
+        return True
 
     @staticmethod
     def stamp_to_float(stamp) -> float:
@@ -730,6 +932,37 @@ class Sam3Master2Node(Node):
         out = np.zeros_like(d, dtype=np.uint8)
         out[valid] = np.clip(255.0 * (d[valid] - vmin) / (vmax - vmin), 0, 255).astype(np.uint8)
         return out
+
+    @staticmethod
+    def load_camera_info_yaml(yaml_path: str) -> Optional[CameraInfo]:
+        if not yaml_path:
+            return None
+        path = os.path.expanduser(str(yaml_path))
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+
+            msg = CameraInfo()
+            msg.width = int(data['width'])
+            msg.height = int(data['height'])
+            msg.distortion_model = str(data.get('distortion_model', 'plumb_bob'))
+            msg.k = [float(x) for x in data['k']]
+            msg.d = [float(x) for x in data.get('d', [])]
+            msg.r = [float(x) for x in data['r']]
+            msg.p = [float(x) for x in data['p']]
+            msg.header.frame_id = str(data.get('frame_id', ''))
+
+            if msg.width <= 0 or msg.height <= 0:
+                return None
+            if len(msg.k) < 9 or float(msg.k[0]) <= 0.0 or float(msg.k[4]) <= 0.0:
+                return None
+            if len(msg.r) < 9 or len(msg.p) < 12:
+                return None
+            return msg
+        except Exception:
+            return None
 
     @staticmethod
     def save_camera_info_yaml(camera_info: CameraInfo, yaml_path: str):
